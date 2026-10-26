@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gorilla Tag Style VR Locomotion</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  #info {
+    position: fixed; top: 10px; width: 100%; text-align: center;
+    color: white; font-family: sans-serif; z-index: 10; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="info">Grip (squeeze) controllers to grab air and swing/pull yourself around. Release to fly with momentum.</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+let scene, camera, renderer, clock;
+let player; // rig group - moves through the world
+let controller1, controller2;
+
+const velocity = new THREE.Vector3();
+const GRAVITY = 9.8;
+
+const grabState = {
+  left:  { grabbing: false, anchor: new THREE.Vector3() },
+  right: { grabbing: false, anchor: new THREE.Vector3() }
+};
+
+init();
+renderer.setAnimationLoop(render);
+
+function init() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x8fd3ff);
+
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000);
+
+  player = new THREE.Group();
+  player.position.set(0, 0, 0);
+  player.add(camera);
+  scene.add(player);
+
+  // Lighting
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+  hemi.position.set(0, 20, 0);
+  scene.add(hemi);
+
+  const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+  dir.position.set(20, 30, 10);
+  scene.add(dir);
+
+  // ---- BIG BASEPLATE ----
+  const groundGeo = new THREE.PlaneGeometry(1000, 1000);
+  const groundMat = new THREE.MeshStandardMaterial({ color: 0x2e8b2e });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground);
+
+  const grid = new THREE.GridHelper(1000, 200, 0x000000, 0x000000);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.15;
+  scene.add(grid);
+
+  // Reference cubes so you can see yourself moving
+  const boxGeo = new THREE.BoxGeometry(2, 2, 2);
+  for (let i = 0; i < 60; i++) {
+    const mat = new THREE.MeshStandardMaterial({ color: Math.random() * 0xffffff });
+    const box = new THREE.Mesh(boxGeo, mat);
+    box.position.set((Math.random() - 0.5) * 200, 1, (Math.random() - 0.5) * 200);
+    scene.add(box);
+  }
+
+  // ---- RENDERER / VR ----
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local-floor');
+  document.body.appendChild(renderer.domElement);
+  document.body.appendChild(VRButton.createButton(renderer));
+
+  // ---- CONTROLLERS ----
+  controller1 = renderer.xr.getController(0);
+  controller2 = renderer.xr.getController(1);
+  player.add(controller1);
+  player.add(controller2);
+
+  const handGeo = new THREE.SphereGeometry(0.06, 16, 16);
+  const handMat1 = new THREE.MeshStandardMaterial({ color: 0xffcc00 });
+  const handMat2 = new THREE.MeshStandardMaterial({ color: 0xff5500 });
+  controller1.add(new THREE.Mesh(handGeo, handMat1));
+  controller2.add(new THREE.Mesh(handGeo, handMat2));
+
+  controller1.addEventListener('squeezestart', () => onGrabStart('left'));
+  controller1.addEventListener('squeezeend', () => onGrabEnd('left'));
+  controller2.addEventListener('squeezestart', () => onGrabStart('right'));
+  controller2.addEventListener('squeezeend', () => onGrabEnd('right'));
+
+  clock = new THREE.Clock();
+  window.addEventListener('resize', onResize);
+}
+
+function onGrabStart(hand) {
+  const controller = hand === 'left' ? controller1 : controller2;
+  const state = grabState[hand];
+  state.grabbing = true;
+  controller.getWorldPosition(state.anchor); // fixed point in world space
+}
+
+function onGrabEnd(hand) {
+  grabState[hand].grabbing = false;
+}
+
+function updateLocomotion(dt) {
+  const targets = [];
+
+  ['left', 'right'].forEach(hand => {
+    const state = grabState[hand];
+    if (state.grabbing) {
+      const controller = hand === 'left' ? controller1 : controller2;
+      // Rig position that would keep the grabbed point fixed in world space
+      const target = state.anchor.clone().sub(controller.position);
+      targets.push(target);
+    }
+  });
+
+  if (targets.length > 0) {
+    const avg = new THREE.Vector3();
+    targets.forEach(t => avg.add(t));
+    avg.divideScalar(targets.length);
+
+    // velocity for momentum after release
+    velocity.copy(avg).sub(player.position).divideScalar(Math.max(dt, 0.0001));
+    player.position.copy(avg);
+  } else {
+    // Free flight with gravity + drag
+    velocity.y -= GRAVITY * dt;
+    player.position.addScaledVector(velocity, dt);
+
+    if (player.position.y < 0) {
+      player.position.y = 0;
+      velocity.y = 0;
+      velocity.x *= 0.9;
+      velocity.z *= 0.9;
+    }
+    velocity.x *= 0.995;
+    velocity.z *= 0.995;
+  }
+
+  // Safety reset if you fall off the world
+  if (player.position.y < -30) {
+    player.position.set(0, 0, 0);
+    velocity.set(0, 0, 0);
+  }
+}
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function render() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  updateLocomotion(dt);
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
