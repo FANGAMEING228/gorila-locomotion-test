@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gorilla Tag Style VR Locomotion</title>
+<title>VR Locomotion + Collision</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
   #info {
@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-<div id="info">Grip (squeeze) controllers to grab air and swing/pull yourself around. Release to fly with momentum.</div>
+<div id="info">Push joystick to walk (no button needed). Grip = Gorilla-Tag arm-swing pull. Collides with boxes & world edge.</div>
 
 <script type="importmap">
 {
@@ -29,16 +29,20 @@ import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 
 let scene, camera, renderer, clock;
-let player; // rig group - moves through the world
+let player;
 let controller1, controller2;
 
 const velocity = new THREE.Vector3();
 const GRAVITY = 9.8;
+const PLAYER_RADIUS = 0.4;
+const WORLD_LIMIT = 480; // boundary radius of the baseplate
 
 const grabState = {
   left:  { grabbing: false, anchor: new THREE.Vector3() },
   right: { grabbing: false, anchor: new THREE.Vector3() }
 };
+
+const colliders = []; // { box: THREE.Box3 }
 
 init();
 renderer.setAnimationLoop(render);
@@ -54,7 +58,6 @@ function init() {
   player.add(camera);
   scene.add(player);
 
-  // Lighting
   const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
   hemi.position.set(0, 20, 0);
   scene.add(hemi);
@@ -75,13 +78,17 @@ function init() {
   grid.material.opacity = 0.15;
   scene.add(grid);
 
-  // Reference cubes so you can see yourself moving
+  // ---- COLLIDABLE REFERENCE BOXES ----
   const boxGeo = new THREE.BoxGeometry(2, 2, 2);
   for (let i = 0; i < 60; i++) {
     const mat = new THREE.MeshStandardMaterial({ color: Math.random() * 0xffffff });
     const box = new THREE.Mesh(boxGeo, mat);
     box.position.set((Math.random() - 0.5) * 200, 1, (Math.random() - 0.5) * 200);
     scene.add(box);
+
+    box.updateMatrixWorld();
+    const bbox = new THREE.Box3().setFromObject(box);
+    colliders.push(bbox);
   }
 
   // ---- RENDERER / VR ----
@@ -118,48 +125,118 @@ function onGrabStart(hand) {
   const controller = hand === 'left' ? controller1 : controller2;
   const state = grabState[hand];
   state.grabbing = true;
-  controller.getWorldPosition(state.anchor); // fixed point in world space
+  controller.getWorldPosition(state.anchor);
 }
 
 function onGrabEnd(hand) {
   grabState[hand].grabbing = false;
 }
 
+// ---- JOYSTICK MOVEMENT (no button press needed) ----
+function getThumbstickMove() {
+  const session = renderer.xr.getSession();
+  if (!session) return new THREE.Vector3();
+
+  const move = new THREE.Vector3();
+  for (const source of session.inputSources) {
+    if (!source.gamepad) continue;
+    const axes = source.gamepad.axes;
+    // axes[2], axes[3] are typical thumbstick X/Y on Quest controllers
+    const x = axes[2] || 0;
+    const y = axes[3] || 0;
+    if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) {
+      const camDir = new THREE.Vector3();
+      camera.getWorldDirection(camDir);
+      camDir.y = 0;
+      camDir.normalize();
+      const camRight = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).negate();
+
+      move.addScaledVector(camDir, -y);
+      move.addScaledVector(camRight, x);
+    }
+  }
+  return move;
+}
+
+function resolveCollisions(nextPos) {
+  // Sphere vs AABB resolution
+  const playerSphere = new THREE.Sphere(
+    new THREE.Vector3(nextPos.x, nextPos.y + 1, nextPos.z),
+    PLAYER_RADIUS
+  );
+
+  for (const box of colliders) {
+    const closest = new THREE.Vector3();
+    box.clampPoint(playerSphere.center, closest);
+    const dist = playerSphere.center.distanceTo(closest);
+
+    if (dist < playerSphere.radius) {
+      const pushDir = new THREE.Vector3().subVectors(playerSphere.center, closest);
+      if (pushDir.lengthSq() === 0) pushDir.set(1, 0, 0);
+      pushDir.normalize();
+      const overlap = playerSphere.radius - dist;
+      nextPos.x += pushDir.x * overlap;
+      nextPos.z += pushDir.z * overlap;
+    }
+  }
+
+  // World boundary (circular wall)
+  const distFromCenter = Math.sqrt(nextPos.x * nextPos.x + nextPos.z * nextPos.z);
+  if (distFromCenter > WORLD_LIMIT) {
+    const scale = WORLD_LIMIT / distFromCenter;
+    nextPos.x *= scale;
+    nextPos.z *= scale;
+  }
+
+  return nextPos;
+}
+
 function updateLocomotion(dt) {
-  const targets = [];
+  const grabTargets = [];
 
   ['left', 'right'].forEach(hand => {
     const state = grabState[hand];
     if (state.grabbing) {
       const controller = hand === 'left' ? controller1 : controller2;
-      // Rig position that would keep the grabbed point fixed in world space
       const target = state.anchor.clone().sub(controller.position);
-      targets.push(target);
+      grabTargets.push(target);
     }
   });
 
-  if (targets.length > 0) {
+  let nextPos = player.position.clone();
+
+  if (grabTargets.length > 0) {
+    // Gorilla-tag style grab pull
     const avg = new THREE.Vector3();
-    targets.forEach(t => avg.add(t));
-    avg.divideScalar(targets.length);
+    grabTargets.forEach(t => avg.add(t));
+    avg.divideScalar(grabTargets.length);
 
-    // velocity for momentum after release
     velocity.copy(avg).sub(player.position).divideScalar(Math.max(dt, 0.0001));
-    player.position.copy(avg);
+    nextPos.copy(avg);
   } else {
-    // Free flight with gravity + drag
-    velocity.y -= GRAVITY * dt;
-    player.position.addScaledVector(velocity, dt);
+    // Joystick-driven smooth movement
+    const moveInput = getThumbstickMove();
+    const speed = 3.0;
+    nextPos.addScaledVector(moveInput, speed * dt);
 
-    if (player.position.y < 0) {
-      player.position.y = 0;
+    // Gravity + momentum
+    velocity.y -= GRAVITY * dt;
+    nextPos.addScaledVector(velocity, dt);
+
+    if (nextPos.y < 0) {
+      nextPos.y = 0;
       velocity.y = 0;
       velocity.x *= 0.9;
       velocity.z *= 0.9;
     }
-    velocity.x *= 0.995;
-    velocity.z *= 0.995;
+    velocity.x *= 0.98;
+    velocity.z *= 0.98;
   }
+
+  // ---- Apply collision resolution ----
+  nextPos = resolveCollisions(nextPos);
+
+  player.position.copy(nextPos);
 
   // Safety reset if you fall off the world
   if (player.position.y < -30) {
