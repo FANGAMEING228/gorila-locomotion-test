@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Real Gorilla Tag Locomotion</title>
+<title>Always-On Gorilla Tag Locomotion</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
   #info {
@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-<div id="info">Squeeze GRIP to grab air/ground, pull your arm to swing your body, release for momentum. Alternate hands to run.</div>
+<div id="info">Just swing your arms — grip is always "on". No buttons needed. Hands turn green near the floor.</div>
 
 <script type="importmap">
 {
@@ -38,13 +38,15 @@ const GRAVITY = 9.8;
 const PLAYER_RADIUS = 0.4;
 const WORLD_LIMIT = 480;
 const FLOOR_TOUCH_HEIGHT = 0.15;
+const REACH_LIMIT = 0.55;      // max "arm length" before auto re-grab
+const DEAD_ZONE = 0.01;        // ignore tiny jitter
 
 const colliders = [];
 
-// Grab state per hand
+// Always-on grab state per hand (no button needed, auto re-anchors)
 const grabState = {
-  left:  { grabbing: false, anchorWorld: new THREE.Vector3(), lastControllerWorld: new THREE.Vector3(), velSamples: [] },
-  right: { grabbing: false, anchorWorld: new THREE.Vector3(), lastControllerWorld: new THREE.Vector3(), velSamples: [] }
+  left:  { anchorWorld: new THREE.Vector3(), initialized: false },
+  right: { anchorWorld: new THREE.Vector3(), initialized: false }
 };
 
 init();
@@ -103,7 +105,7 @@ function init() {
   document.body.appendChild(renderer.domElement);
   document.body.appendChild(VRButton.createButton(renderer));
 
-  // ---- CONTROLLERS ----
+  // ---- CONTROLLERS (no squeeze listeners needed anymore) ----
   controller1 = renderer.xr.getController(0);
   controller2 = renderer.xr.getController(1);
   player.add(controller1);
@@ -117,39 +119,11 @@ function init() {
   controller1.add(hand1Mesh);
   controller2.add(hand2Mesh);
 
-  controller1.addEventListener('squeezestart', () => onGrabStart('left'));
-  controller1.addEventListener('squeezeend', () => onGrabEnd('left'));
-  controller2.addEventListener('squeezestart', () => onGrabStart('right'));
-  controller2.addEventListener('squeezeend', () => onGrabEnd('right'));
-
   clock = new THREE.Clock();
   window.addEventListener('resize', onResize);
 }
 
-function onGrabStart(hand) {
-  const controller = hand === 'left' ? controller1 : controller2;
-  const state = grabState[hand];
-  state.grabbing = true;
-  controller.getWorldPosition(state.anchorWorld);
-  controller.getWorldPosition(state.lastControllerWorld);
-  state.velSamples = [];
-}
-
-function onGrabEnd(hand) {
-  const state = grabState[hand];
-  state.grabbing = false;
-
-  // Apply averaged recent hand velocity as release momentum
-  if (state.velSamples.length > 0) {
-    const avg = new THREE.Vector3();
-    state.velSamples.forEach(v => avg.add(v));
-    avg.divideScalar(state.velSamples.length);
-    // The hand moving in direction X means body should fling in -X (pull-release)
-    velocity.add(avg.multiplyScalar(-1));
-  }
-}
-
-function resolveCollisions(nextPos) {
+function resolveCollisionsXZ(nextPos) {
   const playerSphere = new THREE.Sphere(
     new THREE.Vector3(nextPos.x, nextPos.y + 1, nextPos.z),
     PLAYER_RADIUS
@@ -186,7 +160,7 @@ function updateHandFloorFeedback() {
     controller.getWorldPosition(worldPos);
     const mesh = i === 0 ? hand1Mesh : hand2Mesh;
     if (worldPos.y <= FLOOR_TOUCH_HEIGHT) {
-      mesh.material.color.set(0x00ff00); // green = touching floor
+      mesh.material.color.set(0x00ff00); // green = touching floor (crawl technique)
       mesh.scale.setScalar(1.3);
     } else {
       mesh.material.color.set(i === 0 ? 0xffcc00 : 0xff5500);
@@ -195,71 +169,79 @@ function updateHandFloorFeedback() {
   });
 }
 
-function updateGrabPull(dt) {
-  let bodyTargets = [];
+// Processes one hand's always-on grab-pull, returns desired XZ delta for the body
+function processHandPull(hand, controller) {
+  const state = grabState[hand];
+  const currentWorld = new THREE.Vector3();
+  controller.getWorldPosition(currentWorld);
 
-  ['left', 'right'].forEach(hand => {
-    const state = grabState[hand];
-    if (!state.grabbing) return;
-
-    const controller = hand === 'left' ? controller1 : controller2;
-    const currentWorld = new THREE.Vector3();
-    controller.getWorldPosition(currentWorld);
-
-    // Track velocity sample for momentum on release
-    const instVel = new THREE.Vector3().subVectors(currentWorld, state.lastControllerWorld).divideScalar(Math.max(dt, 0.0001));
-    state.velSamples.push(instVel);
-    if (state.velSamples.length > 6) state.velSamples.shift(); // keep recent samples only
-    state.lastControllerWorld.copy(currentWorld);
-
-    // The body should move so that the controller's LOCAL offset from body,
-    // when added to new body position, equals the fixed world anchor.
-    // controllerLocalPos = currentWorld - player.position (pre-move)
-    const controllerLocalPos = new THREE.Vector3().subVectors(currentWorld, player.position);
-    const desiredBodyPos = new THREE.Vector3().subVectors(state.anchorWorld, controllerLocalPos);
-    bodyTargets.push(desiredBodyPos);
-  });
-
-  if (bodyTargets.length > 0) {
-    const avgTarget = new THREE.Vector3();
-    bodyTargets.forEach(t => avgTarget.add(t));
-    avgTarget.divideScalar(bodyTargets.length);
-
-    // Compute velocity for smooth continuation if still grabbing
-    velocity.copy(avgTarget).sub(player.position).divideScalar(Math.max(dt, 0.0001));
-    player.position.copy(avgTarget);
-    return true; // currently being pulled
+  if (!state.initialized) {
+    state.anchorWorld.copy(currentWorld);
+    state.initialized = true;
+    return new THREE.Vector3(0, 0, 0);
   }
-  return false;
+
+  // How far has the hand drifted from the body (world space, XZ only)
+  const controllerLocalXZ = new THREE.Vector3(
+    currentWorld.x - player.position.x,
+    0,
+    currentWorld.z - player.position.z
+  );
+
+  // Where the body WOULD need to be to keep the hand pinned at anchor
+  const desired = new THREE.Vector3(
+    state.anchorWorld.x - controllerLocalXZ.x,
+    0,
+    state.anchorWorld.z - controllerLocalXZ.z
+  );
+
+  const delta = new THREE.Vector3().subVectors(desired, player.position);
+  if (delta.length() < DEAD_ZONE) delta.set(0, 0, 0);
+
+  // Auto re-grab once "arm" has reached its max virtual reach
+  const reachDist = currentWorld.distanceTo(state.anchorWorld);
+  if (reachDist > REACH_LIMIT) {
+    state.anchorWorld.copy(currentWorld);
+  }
+
+  return delta;
 }
 
 function updateLocomotion(dt) {
-  const isPulling = updateGrabPull(dt);
   updateHandFloorFeedback();
 
-  if (!isPulling) {
-    // Free flight / momentum phase
-    velocity.y -= GRAVITY * dt;
+  const deltaL = processHandPull('left', controller1);
+  const deltaR = processHandPull('right', controller2);
 
-    let nextPos = player.position.clone().addScaledVector(velocity, dt);
+  const combined = new THREE.Vector3().addVectors(deltaL, deltaR);
+  // Average if both hands contribute, otherwise use whichever is active
+  const activeCount = (deltaL.lengthSq() > 0 ? 1 : 0) + (deltaR.lengthSq() > 0 ? 1 : 0);
+  if (activeCount > 0) combined.divideScalar(activeCount);
 
-    if (nextPos.y < 0) {
-      nextPos.y = 0;
-      velocity.y = 0;
-      velocity.x *= 0.92; // ground friction
-      velocity.z *= 0.92;
-    } else {
-      velocity.x *= 0.995; // air drag (keeps momentum longer, like real gtag)
-      velocity.z *= 0.995;
-    }
+  // Apply horizontal pull directly (this IS the arm-swing locomotion)
+  let nextPos = player.position.clone();
+  nextPos.x += combined.x;
+  nextPos.z += combined.z;
 
-    nextPos = resolveCollisions(nextPos);
-    player.position.copy(nextPos);
-  } else {
-    // Still resolve collisions even while pulling (prevents clipping through walls)
-    const corrected = resolveCollisions(player.position.clone());
-    player.position.copy(corrected);
+  // Track horizontal velocity for slight momentum feel
+  velocity.x = combined.x / Math.max(dt, 0.0001) * 0.3 + velocity.x * 0.7;
+  velocity.z = combined.z / Math.max(dt, 0.0001) * 0.3 + velocity.z * 0.7;
+
+  // Gravity always applies to Y independently
+  velocity.y -= GRAVITY * dt;
+  nextPos.y = player.position.y + velocity.y * dt;
+
+  if (nextPos.y < 0) {
+    nextPos.y = 0;
+    velocity.y = 0;
   }
+
+  // Light drag so leftover velocity doesn't carry forever
+  velocity.x *= 0.9;
+  velocity.z *= 0.9;
+
+  nextPos = resolveCollisionsXZ(nextPos);
+  player.position.copy(nextPos);
 
   if (player.position.y < -30) {
     player.position.set(0, 0, 0);
