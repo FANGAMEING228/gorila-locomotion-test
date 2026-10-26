@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VR Locomotion + Collision</title>
+<title>Arm Swing VR Locomotion</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
   #info {
@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-<div id="info">Push joystick to walk (no button needed). Grip = Gorilla-Tag arm-swing pull. Collides with boxes & world edge.</div>
+<div id="info">Just swing your arms (like running) to move. No buttons needed. Colliders active.</div>
 
 <script type="importmap">
 {
@@ -35,14 +35,14 @@ let controller1, controller2;
 const velocity = new THREE.Vector3();
 const GRAVITY = 9.8;
 const PLAYER_RADIUS = 0.4;
-const WORLD_LIMIT = 480; // boundary radius of the baseplate
+const WORLD_LIMIT = 480;
 
-const grabState = {
-  left:  { grabbing: false, anchor: new THREE.Vector3() },
-  right: { grabbing: false, anchor: new THREE.Vector3() }
-};
+// Track previous world positions of controllers to compute swing speed
+const prevPos1 = new THREE.Vector3();
+const prevPos2 = new THREE.Vector3();
+let hasPrev = false;
 
-const colliders = []; // { box: THREE.Box3 }
+const colliders = [];
 
 init();
 renderer.setAnimationLoop(render);
@@ -112,54 +112,11 @@ function init() {
   controller1.add(new THREE.Mesh(handGeo, handMat1));
   controller2.add(new THREE.Mesh(handGeo, handMat2));
 
-  controller1.addEventListener('squeezestart', () => onGrabStart('left'));
-  controller1.addEventListener('squeezeend', () => onGrabEnd('left'));
-  controller2.addEventListener('squeezestart', () => onGrabStart('right'));
-  controller2.addEventListener('squeezeend', () => onGrabEnd('right'));
-
   clock = new THREE.Clock();
   window.addEventListener('resize', onResize);
 }
 
-function onGrabStart(hand) {
-  const controller = hand === 'left' ? controller1 : controller2;
-  const state = grabState[hand];
-  state.grabbing = true;
-  controller.getWorldPosition(state.anchor);
-}
-
-function onGrabEnd(hand) {
-  grabState[hand].grabbing = false;
-}
-
-// ---- JOYSTICK MOVEMENT (no button press needed) ----
-function getThumbstickMove() {
-  const session = renderer.xr.getSession();
-  if (!session) return new THREE.Vector3();
-
-  const move = new THREE.Vector3();
-  for (const source of session.inputSources) {
-    if (!source.gamepad) continue;
-    const axes = source.gamepad.axes;
-    // axes[2], axes[3] are typical thumbstick X/Y on Quest controllers
-    const x = axes[2] || 0;
-    const y = axes[3] || 0;
-    if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) {
-      const camDir = new THREE.Vector3();
-      camera.getWorldDirection(camDir);
-      camDir.y = 0;
-      camDir.normalize();
-      const camRight = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).negate();
-
-      move.addScaledVector(camDir, -y);
-      move.addScaledVector(camRight, x);
-    }
-  }
-  return move;
-}
-
 function resolveCollisions(nextPos) {
-  // Sphere vs AABB resolution
   const playerSphere = new THREE.Sphere(
     new THREE.Vector3(nextPos.x, nextPos.y + 1, nextPos.z),
     PLAYER_RADIUS
@@ -180,7 +137,6 @@ function resolveCollisions(nextPos) {
     }
   }
 
-  // World boundary (circular wall)
   const distFromCenter = Math.sqrt(nextPos.x * nextPos.x + nextPos.z * nextPos.z);
   if (distFromCenter > WORLD_LIMIT) {
     const scale = WORLD_LIMIT / distFromCenter;
@@ -191,54 +147,71 @@ function resolveCollisions(nextPos) {
   return nextPos;
 }
 
-function updateLocomotion(dt) {
-  const grabTargets = [];
+function updateArmSwing(dt) {
+  const worldPos1 = new THREE.Vector3();
+  const worldPos2 = new THREE.Vector3();
+  controller1.getWorldPosition(worldPos1);
+  controller2.getWorldPosition(worldPos2);
 
-  ['left', 'right'].forEach(hand => {
-    const state = grabState[hand];
-    if (state.grabbing) {
-      const controller = hand === 'left' ? controller1 : controller2;
-      const target = state.anchor.clone().sub(controller.position);
-      grabTargets.push(target);
-    }
-  });
+  if (!hasPrev) {
+    prevPos1.copy(worldPos1);
+    prevPos2.copy(worldPos2);
+    hasPrev = true;
+    return;
+  }
+
+  // Velocity of each hand (per second)
+  const vel1 = new THREE.Vector3().subVectors(worldPos1, prevPos1).divideScalar(dt);
+  const vel2 = new THREE.Vector3().subVectors(worldPos2, prevPos2).divideScalar(dt);
+
+  prevPos1.copy(worldPos1);
+  prevPos2.copy(worldPos2);
+
+  // Only count horizontal-ish swing speed (ignore pure up/down noise a bit)
+  const speed1 = Math.sqrt(vel1.x * vel1.x + vel1.z * vel1.z + Math.abs(vel1.y) * 0.5);
+  const speed2 = Math.sqrt(vel2.x * vel2.x + vel2.z * vel2.z + Math.abs(vel2.y) * 0.5);
+
+  const threshold = 0.6; // minimum swing speed to start moving
+  const maxSpeedCap = 6.0;
+
+  let swingPower = 0;
+  if (speed1 > threshold) swingPower += Math.min(speed1, maxSpeedCap) - threshold;
+  if (speed2 > threshold) swingPower += Math.min(speed2, maxSpeedCap) - threshold;
+
+  if (swingPower > 0) {
+    // Move in the direction the player is facing (head yaw), not where hands point
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    camDir.y = 0;
+    camDir.normalize();
+
+    const pushForce = swingPower * 1.2; // tune multiplier for speed feel
+    velocity.x += camDir.x * pushForce * dt;
+    velocity.z += camDir.z * pushForce * dt;
+  }
+}
+
+function updateLocomotion(dt) {
+  updateArmSwing(dt);
 
   let nextPos = player.position.clone();
 
-  if (grabTargets.length > 0) {
-    // Gorilla-tag style grab pull
-    const avg = new THREE.Vector3();
-    grabTargets.forEach(t => avg.add(t));
-    avg.divideScalar(grabTargets.length);
+  // Gravity
+  velocity.y -= GRAVITY * dt;
+  nextPos.addScaledVector(velocity, dt);
 
-    velocity.copy(avg).sub(player.position).divideScalar(Math.max(dt, 0.0001));
-    nextPos.copy(avg);
-  } else {
-    // Joystick-driven smooth movement
-    const moveInput = getThumbstickMove();
-    const speed = 3.0;
-    nextPos.addScaledVector(moveInput, speed * dt);
-
-    // Gravity + momentum
-    velocity.y -= GRAVITY * dt;
-    nextPos.addScaledVector(velocity, dt);
-
-    if (nextPos.y < 0) {
-      nextPos.y = 0;
-      velocity.y = 0;
-      velocity.x *= 0.9;
-      velocity.z *= 0.9;
-    }
-    velocity.x *= 0.98;
-    velocity.z *= 0.98;
+  if (nextPos.y < 0) {
+    nextPos.y = 0;
+    velocity.y = 0;
   }
 
-  // ---- Apply collision resolution ----
-  nextPos = resolveCollisions(nextPos);
+  // Friction/drag so you slow down naturally when you stop swinging
+  velocity.x *= 0.95;
+  velocity.z *= 0.95;
 
+  nextPos = resolveCollisions(nextPos);
   player.position.copy(nextPos);
 
-  // Safety reset if you fall off the world
   if (player.position.y < -30) {
     player.position.set(0, 0, 0);
     velocity.set(0, 0, 0);
