@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arm Swing VR Locomotion</title>
+<title>Real Gorilla Tag Locomotion</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
   #info {
@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-<div id="info">Just swing your arms (like running) to move. No buttons needed. Colliders active.</div>
+<div id="info">Squeeze GRIP to grab air/ground, pull your arm to swing your body, release for momentum. Alternate hands to run.</div>
 
 <script type="importmap">
 {
@@ -31,18 +31,21 @@ import { VRButton } from 'three/addons/webxr/VRButton.js';
 let scene, camera, renderer, clock;
 let player;
 let controller1, controller2;
+let hand1Mesh, hand2Mesh;
 
 const velocity = new THREE.Vector3();
 const GRAVITY = 9.8;
 const PLAYER_RADIUS = 0.4;
 const WORLD_LIMIT = 480;
-
-// Track previous world positions of controllers to compute swing speed
-const prevPos1 = new THREE.Vector3();
-const prevPos2 = new THREE.Vector3();
-let hasPrev = false;
+const FLOOR_TOUCH_HEIGHT = 0.15;
 
 const colliders = [];
+
+// Grab state per hand
+const grabState = {
+  left:  { grabbing: false, anchorWorld: new THREE.Vector3(), lastControllerWorld: new THREE.Vector3(), velSamples: [] },
+  right: { grabbing: false, anchorWorld: new THREE.Vector3(), lastControllerWorld: new THREE.Vector3(), velSamples: [] }
+};
 
 init();
 renderer.setAnimationLoop(render);
@@ -106,14 +109,44 @@ function init() {
   player.add(controller1);
   player.add(controller2);
 
-  const handGeo = new THREE.SphereGeometry(0.06, 16, 16);
+  const handGeo = new THREE.SphereGeometry(0.07, 16, 16);
   const handMat1 = new THREE.MeshStandardMaterial({ color: 0xffcc00 });
   const handMat2 = new THREE.MeshStandardMaterial({ color: 0xff5500 });
-  controller1.add(new THREE.Mesh(handGeo, handMat1));
-  controller2.add(new THREE.Mesh(handGeo, handMat2));
+  hand1Mesh = new THREE.Mesh(handGeo, handMat1);
+  hand2Mesh = new THREE.Mesh(handGeo, handMat2);
+  controller1.add(hand1Mesh);
+  controller2.add(hand2Mesh);
+
+  controller1.addEventListener('squeezestart', () => onGrabStart('left'));
+  controller1.addEventListener('squeezeend', () => onGrabEnd('left'));
+  controller2.addEventListener('squeezestart', () => onGrabStart('right'));
+  controller2.addEventListener('squeezeend', () => onGrabEnd('right'));
 
   clock = new THREE.Clock();
   window.addEventListener('resize', onResize);
+}
+
+function onGrabStart(hand) {
+  const controller = hand === 'left' ? controller1 : controller2;
+  const state = grabState[hand];
+  state.grabbing = true;
+  controller.getWorldPosition(state.anchorWorld);
+  controller.getWorldPosition(state.lastControllerWorld);
+  state.velSamples = [];
+}
+
+function onGrabEnd(hand) {
+  const state = grabState[hand];
+  state.grabbing = false;
+
+  // Apply averaged recent hand velocity as release momentum
+  if (state.velSamples.length > 0) {
+    const avg = new THREE.Vector3();
+    state.velSamples.forEach(v => avg.add(v));
+    avg.divideScalar(state.velSamples.length);
+    // The hand moving in direction X means body should fling in -X (pull-release)
+    velocity.add(avg.multiplyScalar(-1));
+  }
 }
 
 function resolveCollisions(nextPos) {
@@ -147,70 +180,86 @@ function resolveCollisions(nextPos) {
   return nextPos;
 }
 
-function updateArmSwing(dt) {
-  const worldPos1 = new THREE.Vector3();
-  const worldPos2 = new THREE.Vector3();
-  controller1.getWorldPosition(worldPos1);
-  controller2.getWorldPosition(worldPos2);
+function updateHandFloorFeedback() {
+  [controller1, controller2].forEach((controller, i) => {
+    const worldPos = new THREE.Vector3();
+    controller.getWorldPosition(worldPos);
+    const mesh = i === 0 ? hand1Mesh : hand2Mesh;
+    if (worldPos.y <= FLOOR_TOUCH_HEIGHT) {
+      mesh.material.color.set(0x00ff00); // green = touching floor
+      mesh.scale.setScalar(1.3);
+    } else {
+      mesh.material.color.set(i === 0 ? 0xffcc00 : 0xff5500);
+      mesh.scale.setScalar(1.0);
+    }
+  });
+}
 
-  if (!hasPrev) {
-    prevPos1.copy(worldPos1);
-    prevPos2.copy(worldPos2);
-    hasPrev = true;
-    return;
+function updateGrabPull(dt) {
+  let bodyTargets = [];
+
+  ['left', 'right'].forEach(hand => {
+    const state = grabState[hand];
+    if (!state.grabbing) return;
+
+    const controller = hand === 'left' ? controller1 : controller2;
+    const currentWorld = new THREE.Vector3();
+    controller.getWorldPosition(currentWorld);
+
+    // Track velocity sample for momentum on release
+    const instVel = new THREE.Vector3().subVectors(currentWorld, state.lastControllerWorld).divideScalar(Math.max(dt, 0.0001));
+    state.velSamples.push(instVel);
+    if (state.velSamples.length > 6) state.velSamples.shift(); // keep recent samples only
+    state.lastControllerWorld.copy(currentWorld);
+
+    // The body should move so that the controller's LOCAL offset from body,
+    // when added to new body position, equals the fixed world anchor.
+    // controllerLocalPos = currentWorld - player.position (pre-move)
+    const controllerLocalPos = new THREE.Vector3().subVectors(currentWorld, player.position);
+    const desiredBodyPos = new THREE.Vector3().subVectors(state.anchorWorld, controllerLocalPos);
+    bodyTargets.push(desiredBodyPos);
+  });
+
+  if (bodyTargets.length > 0) {
+    const avgTarget = new THREE.Vector3();
+    bodyTargets.forEach(t => avgTarget.add(t));
+    avgTarget.divideScalar(bodyTargets.length);
+
+    // Compute velocity for smooth continuation if still grabbing
+    velocity.copy(avgTarget).sub(player.position).divideScalar(Math.max(dt, 0.0001));
+    player.position.copy(avgTarget);
+    return true; // currently being pulled
   }
-
-  // Velocity of each hand (per second)
-  const vel1 = new THREE.Vector3().subVectors(worldPos1, prevPos1).divideScalar(dt);
-  const vel2 = new THREE.Vector3().subVectors(worldPos2, prevPos2).divideScalar(dt);
-
-  prevPos1.copy(worldPos1);
-  prevPos2.copy(worldPos2);
-
-  // Only count horizontal-ish swing speed (ignore pure up/down noise a bit)
-  const speed1 = Math.sqrt(vel1.x * vel1.x + vel1.z * vel1.z + Math.abs(vel1.y) * 0.5);
-  const speed2 = Math.sqrt(vel2.x * vel2.x + vel2.z * vel2.z + Math.abs(vel2.y) * 0.5);
-
-  const threshold = 0.6; // minimum swing speed to start moving
-  const maxSpeedCap = 6.0;
-
-  let swingPower = 0;
-  if (speed1 > threshold) swingPower += Math.min(speed1, maxSpeedCap) - threshold;
-  if (speed2 > threshold) swingPower += Math.min(speed2, maxSpeedCap) - threshold;
-
-  if (swingPower > 0) {
-    // Move in the direction the player is facing (head yaw), not where hands point
-    const camDir = new THREE.Vector3();
-    camera.getWorldDirection(camDir);
-    camDir.y = 0;
-    camDir.normalize();
-
-    const pushForce = swingPower * 1.2; // tune multiplier for speed feel
-    velocity.x += camDir.x * pushForce * dt;
-    velocity.z += camDir.z * pushForce * dt;
-  }
+  return false;
 }
 
 function updateLocomotion(dt) {
-  updateArmSwing(dt);
+  const isPulling = updateGrabPull(dt);
+  updateHandFloorFeedback();
 
-  let nextPos = player.position.clone();
+  if (!isPulling) {
+    // Free flight / momentum phase
+    velocity.y -= GRAVITY * dt;
 
-  // Gravity
-  velocity.y -= GRAVITY * dt;
-  nextPos.addScaledVector(velocity, dt);
+    let nextPos = player.position.clone().addScaledVector(velocity, dt);
 
-  if (nextPos.y < 0) {
-    nextPos.y = 0;
-    velocity.y = 0;
+    if (nextPos.y < 0) {
+      nextPos.y = 0;
+      velocity.y = 0;
+      velocity.x *= 0.92; // ground friction
+      velocity.z *= 0.92;
+    } else {
+      velocity.x *= 0.995; // air drag (keeps momentum longer, like real gtag)
+      velocity.z *= 0.995;
+    }
+
+    nextPos = resolveCollisions(nextPos);
+    player.position.copy(nextPos);
+  } else {
+    // Still resolve collisions even while pulling (prevents clipping through walls)
+    const corrected = resolveCollisions(player.position.clone());
+    player.position.copy(corrected);
   }
-
-  // Friction/drag so you slow down naturally when you stop swinging
-  velocity.x *= 0.95;
-  velocity.z *= 0.95;
-
-  nextPos = resolveCollisions(nextPos);
-  player.position.copy(nextPos);
 
   if (player.position.y < -30) {
     player.position.set(0, 0, 0);
